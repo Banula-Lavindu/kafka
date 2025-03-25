@@ -22,10 +22,11 @@ client = KafkaClient(hosts=KAFKA_BROKER)
 topic = client.topics[TOPIC.encode("utf-8")]
 # Configure producer to only handle new messages
 producer = topic.get_sync_producer(
-    delivery_reports=False,  # Disable delivery reports for performance
-    linger_ms=10,  # Small batching delay for better throughput
+    delivery_reports=True,  # Enable delivery reports to verify messages are sent
+    linger_ms=0,  # Don't batch messages for streaming
     max_request_size=1000000,  # Set max request size to 1MB
     compression=0,  # No compression (0), can use 1 for GZIP if needed
+    required_acks=1,  # Wait for leader acknowledgment
 )
 
 # Stop flag for clean shutdown
@@ -89,9 +90,15 @@ def stream_cctv(cam_name, rtsp_url):
 
                 # Send frame to Kafka
                 try:
-                    producer.produce(f"{cam_name}".encode() + b":" + buffer.tobytes())
+                    message_data = f"{cam_name}".encode() + b":" + buffer.tobytes()
+                    producer.produce(message_data)
+                    print(f"Sent frame from {cam_name}: {len(message_data)} bytes")
                 except Exception as e:
-                    print(f"⚠️ Kafka Error: {e}")
+                    print(f"⚠️ Kafka Error for {cam_name}: {e}")
+                    time.sleep(0.5)  # Brief pause on error
+
+                # Brief pause between frames
+                time.sleep(0.1)
 
         except Exception as e:
             print(f"⚠️ Unexpected error with {cam_name}: {str(e)}")

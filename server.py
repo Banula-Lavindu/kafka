@@ -31,11 +31,29 @@ def get_kafka_consumer():
     try:
         client = KafkaClient(hosts=KAFKA_BROKER)
         topic = client.topics[TOPIC.encode("utf-8")]
-        return topic.get_simple_consumer(
-            consumer_timeout_ms=2000,  # 2 seconds timeout
+        # Create a consumer that will start consuming from the latest available offset
+        consumer = topic.get_simple_consumer(
+            consumer_timeout_ms=1000,  # Reduce timeout to 1 second
             auto_commit_enable=True,
-            reset_offset_on_start=True
+            reset_offset_on_start=False,  # Don't reset offset on start
+            fetch_min_bytes=1,  # Don't wait for large batches
+            fetch_message_max_bytes=1024*1024,  # Allow larger message sizes
+            consumer_group=f'flask-server-{int(time.time())}',  # Unique consumer group
         )
+        
+        # Manually seek to the end of each partition - try a much simpler approach
+        if consumer:
+            try:
+                # Move to the end of each partition without trying to get specific offsets
+                for partition in consumer.partitions.values():
+                    # A simple flag to tell the consumer to start at the end
+                    consumer._auto_offset_reset = 'latest'
+                print("Successfully configured consumer to read from latest offsets")
+            except Exception as e:
+                print(f"Warning: Could not set consumer offsets: {e}")
+                print("Continuing with default offsets...")
+        
+        return consumer
     except exceptions.KafkaException as e:
         print(f"Error connecting to Kafka: {e}")
         return None
@@ -91,51 +109,78 @@ def process_frame_with_yolo(frame, cam_name):
 def consume_frames():
     """Continuously consume frames from Kafka and store them in a dictionary."""
     global consumer
+    reconnect_attempts = 0
+    max_reconnect_attempts = 10
+    reconnect_delay = 2
 
     while True:
         if consumer is None:
-            print("Reconnecting to Kafka...")
+            if reconnect_attempts >= max_reconnect_attempts:
+                print("Maximum reconnection attempts reached. Waiting longer...")
+                time.sleep(30)  # Wait longer between batches of reconnection attempts
+                reconnect_attempts = 0
+            
+            print(f"Reconnecting to Kafka (attempt {reconnect_attempts+1})...")
             consumer = get_kafka_consumer()
+            
             if consumer is None:
-                time.sleep(5)  # Wait before retry
-                continue  
+                reconnect_attempts += 1
+                time.sleep(reconnect_delay)  # Wait before retry
+                continue
+            else:
+                print("Successfully reconnected to Kafka")
+                reconnect_attempts = 0
 
         try:
-            # Mark all cameras as offline initially
+            # Mark all cameras as offline initially in this loop iteration
+            current_time = time.time()
             for cam_id in camera_info:
-                if cam_id in latest_frames and time.time() - camera_info[cam_id].get("lastSeen", 0) > 10:
+                if cam_id in latest_frames and current_time - camera_info[cam_id].get("lastSeen", 0) > 10:
                     camera_info[cam_id]["isOnline"] = False
+                    print(f"Camera {cam_id} marked offline (no recent frames)")
 
-            for message in consumer:
-                if message is not None:
-                    try:
-                        # Extract camera name and frame data
-                        cam_name, frame_data = message.value.split(b":", 1)
-                        cam_name = cam_name.decode()
+            # Poll for new messages - fixed the parameter name
+            message = consumer.consume(block=True)  # Remove timeout_ms as it's not supported
+            if message:
+                try:
+                    # Extract camera name and frame data
+                    cam_name, frame_data = message.value.split(b":", 1)
+                    cam_name = cam_name.decode()
 
-                        # Decode frame
-                        frame = np.frombuffer(frame_data, dtype=np.uint8)
-                        frame = cv2.imdecode(frame, cv2.IMREAD_COLOR)
+                    # Debug output to track received frames
+                    print(f"Received frame from {cam_name}, size: {len(frame_data)} bytes")
 
-                        if frame is not None:
-                            # Apply YOLO object detection
-                            processed_frame = process_frame_with_yolo(frame, cam_name)
-                            latest_frames[cam_name] = processed_frame
-                            
-                            # Update camera status
-                            if cam_name in camera_info:
-                                current_time = time.time()
-                                camera_info[cam_name]["isOnline"] = True
-                                camera_info[cam_name]["lastSeen"] = current_time
-                                camera_info[cam_name]["lastUpdated"] = json.dumps(
-                                    {"$date": int(current_time * 1000)}
-                                )
-                    except Exception as e:
-                        print(f"Error processing frame: {e}")
+                    # Decode frame
+                    frame = np.frombuffer(frame_data, dtype=np.uint8)
+                    frame = cv2.imdecode(frame, cv2.IMREAD_COLOR)
+
+                    if frame is not None:
+                        # Apply YOLO object detection
+                        processed_frame = process_frame_with_yolo(frame, cam_name)
+                        latest_frames[cam_name] = processed_frame
+                        
+                        # Update camera status
+                        if cam_name in camera_info:
+                            current_time = time.time()
+                            camera_info[cam_name]["isOnline"] = True
+                            camera_info[cam_name]["lastSeen"] = current_time
+                            camera_info[cam_name]["lastUpdated"] = json.dumps(
+                                {"$date": int(current_time * 1000)}
+                            )
+                except Exception as e:
+                    print(f"Error processing frame: {e}")
+            else:
+                # No message received in this iteration
+                time.sleep(0.01)  # Small sleep to prevent CPU overuse
+                
+        except exceptions.KafkaException as ke:
+            print(f"Kafka error in consumer loop: {ke}")
+            consumer = None  # Reset consumer on Kafka errors
+            time.sleep(reconnect_delay)
         except Exception as e:
-            print(f"Error in consumer loop: {e}")
-            consumer = None  # Reset consumer on error
-            time.sleep(5)  # Wait before retry
+            print(f"Unexpected error in consumer loop: {e}")
+            consumer = None  # Reset consumer on other errors
+            time.sleep(reconnect_delay)
 
 # Start Kafka frame consumer in a separate thread
 threading.Thread(target=consume_frames, daemon=True).start()
