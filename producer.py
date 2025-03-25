@@ -5,7 +5,7 @@ from pykafka import KafkaClient
 import time
 
 # Kafka Configuration
-KAFKA_BROKER = "localhost:9092"
+KAFKA_BROKER = "35.226.126.108:9092"
 TOPIC = "cctv"
 
 # List of RTSP Camera URLs

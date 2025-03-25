@@ -14,7 +14,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})  # Configure CORS more permissively
 
 # Kafka Configuration
-KAFKA_BROKER = "localhost:9092"
+KAFKA_BROKER = "10.128.0.7:9092"
 TOPIC = "cctv"
 
 # Load YOLO model
