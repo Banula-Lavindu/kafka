@@ -11,10 +11,45 @@ import time
 import io
 import socket
 import logging
+from threading import Lock
+import datetime
+import psutil
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Create a custom log handler to capture logs
+class MemoryLogHandler(logging.Handler):
+    def __init__(self, max_entries=1000):
+        super().__init__()
+        self.max_entries = max_entries
+        self.logs = []
+        self.lock = Lock()
+        
+    def emit(self, record):
+        with self.lock:
+            self.logs.append({
+                'timestamp': datetime.datetime.fromtimestamp(record.created).isoformat(),
+                'level': record.levelname,
+                'message': self.format(record)
+            })
+            # Keep only the last max_entries
+            if len(self.logs) > self.max_entries:
+                self.logs = self.logs[-self.max_entries:]
+    
+    def get_logs(self, limit=100, level=None):
+        with self.lock:
+            if level:
+                filtered_logs = [log for log in self.logs if log['level'] == level.upper()]
+            else:
+                filtered_logs = self.logs.copy()
+            return filtered_logs[-limit:]
+
+# Create and add our custom handler
+memory_handler = MemoryLogHandler()
+memory_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(memory_handler)
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})  # Configure CORS more permissively
@@ -318,6 +353,58 @@ if not os.path.exists('static/offline.jpg'):
     offline_img = np.zeros((360, 640, 3), dtype=np.uint8)
     cv2.putText(offline_img, "Camera Offline", (150, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
     cv2.imwrite('static/offline.jpg', offline_img)
+
+@app.route('/api/server/status', methods=['GET'])
+def server_status():
+    """Get server status information including Kafka connection."""
+    
+    # Check Kafka connection
+    kafka_status = "Connected" if consumer is not None else "Disconnected"
+    
+    # Count online cameras
+    online_cameras = sum(1 for cam_id in camera_info if camera_info[cam_id]["isOnline"])
+    
+    # Get basic system info
+    memory = psutil.virtual_memory()
+    disk = psutil.disk_usage('/')
+    
+    status_info = {
+        "server": {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "uptime": time.time() - psutil.boot_time(),
+            "hostname": socket.gethostname(),
+            "ip": get_local_ip()
+        },
+        "kafka": {
+            "status": kafka_status,
+            "broker": KAFKA_BROKER,
+            "topic": TOPIC
+        },
+        "cameras": {
+            "total": len(camera_info),
+            "online": online_cameras,
+            "frames_received": sum(1 for _ in latest_frames)
+        },
+        "resources": {
+            "cpu_percent": psutil.cpu_percent(),
+            "memory_percent": memory.percent,
+            "memory_used_gb": round(memory.used / (1024**3), 2),
+            "memory_total_gb": round(memory.total / (1024**3), 2),
+            "disk_percent": disk.percent,
+            "disk_free_gb": round(disk.free / (1024**3), 2)
+        }
+    }
+    
+    return jsonify(status_info)
+
+@app.route('/api/server/logs', methods=['GET'])
+def get_server_logs():
+    """Get server logs."""
+    limit = request.args.get('limit', default=100, type=int)
+    level = request.args.get('level', default=None, type=str)
+    
+    logs = memory_handler.get_logs(limit=limit, level=level)
+    return jsonify(logs)
 
 if __name__ == "__main__":
     # Get the local IP for better network visibility
