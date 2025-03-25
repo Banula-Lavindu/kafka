@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CCTV Surveillance</title>
+    <style>
+        body { text-align: center; font-family: Arial, sans-serif; }
+        .camera-container { display: flex; flex-wrap: wrap; justify-content: center; }
+        .camera { margin: 10px; }
+        img { width: 400px; height: auto; border: 2px solid black; }
+    </style>
+</head>
+<body>
+    <h1>CCTV Surveillance System</h1>
+    <div class="camera-container">
+        {% for cam in cameras %}
+        <div class="camera">
+            <h3>{{ cam }}</h3>
+            <img src="{{ url_for('video_feed', cam_name=cam) }}" alt="Live Feed">
+        </div>
+        {% endfor %}
+    </div>
+</body>
+</html>
