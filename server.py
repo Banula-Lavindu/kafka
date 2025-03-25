@@ -9,93 +9,36 @@ import json
 import os
 import time
 import io
-import socket
-import logging
-from threading import Lock
-import datetime
-import psutil
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Create a custom log handler to capture logs
-class MemoryLogHandler(logging.Handler):
-    def __init__(self, max_entries=1000):
-        super().__init__()
-        self.max_entries = max_entries
-        self.logs = []
-        self.lock = Lock()
-        
-    def emit(self, record):
-        with self.lock:
-            self.logs.append({
-                'timestamp': datetime.datetime.fromtimestamp(record.created).isoformat(),
-                'level': record.levelname,
-                'message': self.format(record)
-            })
-            # Keep only the last max_entries
-            if len(self.logs) > self.max_entries:
-                self.logs = self.logs[-self.max_entries:]
-    
-    def get_logs(self, limit=100, level=None):
-        with self.lock:
-            if level:
-                filtered_logs = [log for log in self.logs if log['level'] == level.upper()]
-            else:
-                filtered_logs = self.logs.copy()
-            return filtered_logs[-limit:]
-
-# Create and add our custom handler
-memory_handler = MemoryLogHandler()
-memory_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-logger.addHandler(memory_handler)
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})  # Configure CORS more permissively
 
-# Kafka Configuration - use external IP if server is on GCP
-# Make sure this IP is accessible from both your local producer and the GCP instance
+# Kafka Configuration
 KAFKA_BROKER = "10.128.0.7:9092"
 TOPIC = "cctv"
-KAFKA_CONNECT_RETRY_INTERVAL = 5  # seconds
 
 # Load YOLO model
 try:
     model = YOLO('yolov8n.pt')  # Load pretrained YOLOv8 model (nano version)
-    logger.info("YOLO model loaded successfully")
+    print("YOLO model loaded successfully")
 except Exception as e:
-    logger.error(f"Error loading YOLO model: {e}")
+    print(f"Error loading YOLO model: {e}")
     model = None
 
 # Function to create a Kafka consumer
 def get_kafka_consumer():
     """Create and return a Kafka consumer with error handling."""
-    retry_count = 0
-    max_retries = 5
-    
-    while retry_count < max_retries:
-        try:
-            logger.info(f"Attempting to connect to Kafka broker at {KAFKA_BROKER}")
-            client = KafkaClient(hosts=KAFKA_BROKER, socket_timeout_ms=10000)
-            topic = client.topics[TOPIC.encode("utf-8")]
-            consumer = topic.get_simple_consumer(
-                consumer_timeout_ms=5000,  # 5 seconds timeout
-                auto_commit_enable=True,
-                reset_offset_on_start=True,
-                consumer_group=f'cctv-server-{socket.gethostname()}',  # Unique consumer group
-                fetch_min_bytes=1024,  # Minimum amount of data to fetch
-                fetch_wait_max_ms=2000  # Max time to wait for minimum bytes
-            )
-            logger.info("Successfully connected to Kafka")
-            return consumer
-        except exceptions.KafkaException as e:
-            retry_count += 1
-            logger.error(f"Error connecting to Kafka (attempt {retry_count}/{max_retries}): {e}")
-            time.sleep(KAFKA_CONNECT_RETRY_INTERVAL)
-    
-    logger.error(f"Failed to connect to Kafka after {max_retries} attempts")
-    return None
+    try:
+        client = KafkaClient(hosts=KAFKA_BROKER)
+        topic = client.topics[TOPIC.encode("utf-8")]
+        return topic.get_simple_consumer(
+            consumer_timeout_ms=2000,  # 2 seconds timeout
+            auto_commit_enable=True,
+            reset_offset_on_start=True
+        )
+    except exceptions.KafkaException as e:
+        print(f"Error connecting to Kafka: {e}")
+        return None
 
 # Initialize Kafka consumer
 consumer = get_kafka_consumer()
@@ -148,33 +91,22 @@ def process_frame_with_yolo(frame, cam_name):
 def consume_frames():
     """Continuously consume frames from Kafka and store them in a dictionary."""
     global consumer
-    last_reconnect_attempt = 0
-    reconnect_threshold = 10  # seconds
 
     while True:
         if consumer is None:
-            current_time = time.time()
-            if current_time - last_reconnect_attempt > reconnect_threshold:
-                logger.info("Attempting to reconnect to Kafka...")
-                consumer = get_kafka_consumer()
-                last_reconnect_attempt = current_time
-            else:
-                time.sleep(1)  # Don't hammer reconnection attempts
+            print("Reconnecting to Kafka...")
+            consumer = get_kafka_consumer()
+            if consumer is None:
+                time.sleep(5)  # Wait before retry
                 continue  
 
         try:
             # Mark all cameras as offline initially
-            current_time = time.time()
             for cam_id in camera_info:
-                if cam_id in latest_frames and current_time - camera_info[cam_id].get("lastSeen", 0) > 10:
-                    if camera_info[cam_id]["isOnline"]:
-                        logger.info(f"Camera {cam_id} is now offline")
-                        camera_info[cam_id]["isOnline"] = False
+                if cam_id in latest_frames and time.time() - camera_info[cam_id].get("lastSeen", 0) > 10:
+                    camera_info[cam_id]["isOnline"] = False
 
-            # Poll for messages
-            message_count = 0
             for message in consumer:
-                message_count += 1
                 if message is not None:
                     try:
                         # Extract camera name and frame data
@@ -193,35 +125,17 @@ def consume_frames():
                             # Update camera status
                             if cam_name in camera_info:
                                 current_time = time.time()
-                                previous_status = camera_info[cam_name]["isOnline"]
                                 camera_info[cam_name]["isOnline"] = True
                                 camera_info[cam_name]["lastSeen"] = current_time
                                 camera_info[cam_name]["lastUpdated"] = json.dumps(
                                     {"$date": int(current_time * 1000)}
                                 )
-                                
-                                if not previous_status:
-                                    logger.info(f"Camera {cam_name} is now online")
-                                    
                     except Exception as e:
-                        logger.exception(f"Error processing frame: {e}")
-                
-                # Break after processing some messages to check for offline cameras
-                if message_count > 10:
-                    break
-                    
-            # If no messages received, sleep a bit to avoid CPU spin
-            if message_count == 0:
-                time.sleep(0.5)
-                
-        except exceptions.ConsumerStoppedException:
-            logger.warning("Consumer stopped. Attempting to reconnect...")
-            consumer = None
-            time.sleep(1)
+                        print(f"Error processing frame: {e}")
         except Exception as e:
-            logger.exception(f"Error in consumer loop: {e}")
+            print(f"Error in consumer loop: {e}")
             consumer = None  # Reset consumer on error
-            time.sleep(2)  # Wait before retry
+            time.sleep(5)  # Wait before retry
 
 # Start Kafka frame consumer in a separate thread
 threading.Thread(target=consume_frames, daemon=True).start()
@@ -354,60 +268,9 @@ if not os.path.exists('static/offline.jpg'):
     cv2.putText(offline_img, "Camera Offline", (150, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
     cv2.imwrite('static/offline.jpg', offline_img)
 
-@app.route('/api/server/status', methods=['GET'])
-def server_status():
-    """Get server status information including Kafka connection."""
-    
-    # Check Kafka connection
-    kafka_status = "Connected" if consumer is not None else "Disconnected"
-    
-    # Count online cameras
-    online_cameras = sum(1 for cam_id in camera_info if camera_info[cam_id]["isOnline"])
-    
-    # Get basic system info
-    memory = psutil.virtual_memory()
-    disk = psutil.disk_usage('/')
-    
-    status_info = {
-        "server": {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "uptime": time.time() - psutil.boot_time(),
-            "hostname": socket.gethostname(),
-            "ip": get_local_ip()
-        },
-        "kafka": {
-            "status": kafka_status,
-            "broker": KAFKA_BROKER,
-            "topic": TOPIC
-        },
-        "cameras": {
-            "total": len(camera_info),
-            "online": online_cameras,
-            "frames_received": sum(1 for _ in latest_frames)
-        },
-        "resources": {
-            "cpu_percent": psutil.cpu_percent(),
-            "memory_percent": memory.percent,
-            "memory_used_gb": round(memory.used / (1024**3), 2),
-            "memory_total_gb": round(memory.total / (1024**3), 2),
-            "disk_percent": disk.percent,
-            "disk_free_gb": round(disk.free / (1024**3), 2)
-        }
-    }
-    
-    return jsonify(status_info)
-
-@app.route('/api/server/logs', methods=['GET'])
-def get_server_logs():
-    """Get server logs."""
-    limit = request.args.get('limit', default=100, type=int)
-    level = request.args.get('level', default=None, type=str)
-    
-    logs = memory_handler.get_logs(limit=limit, level=level)
-    return jsonify(logs)
-
 if __name__ == "__main__":
     # Get the local IP for better network visibility
+    import socket
     def get_local_ip():
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -419,8 +282,7 @@ if __name__ == "__main__":
             return "127.0.0.1"
     
     local_ip = get_local_ip()
-    logger.info(f"Server running at: http://{local_ip}:5000")
-    logger.info(f"Connected to Kafka broker at: {KAFKA_BROKER}")
+    print(f"Server running at: http://{local_ip}:5000")
     
     app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)
 
